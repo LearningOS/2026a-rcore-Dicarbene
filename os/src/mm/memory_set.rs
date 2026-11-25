@@ -284,6 +284,157 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Lab2 user-memory access, implemented with Codex assistance according to
+    /// https://learningos.cn/rCore-Tutorial-Guide/chapter4/7exercise.html
+    pub fn translate_user_byte(
+        &self,
+        address: usize,
+        permission: MapPermission,
+    ) -> Option<PhysAddr> {
+        let va = VirtAddr::from(address);
+        // VirtAddr::from masks high bits; reject non-canonical aliases first.
+        if usize::from(va) != address {
+            return None;
+        }
+        let pte = self.translate(va.floor())?;
+        let required = PTEFlags::from_bits((permission | MapPermission::U).bits).unwrap();
+        if !pte.flags().contains(required) || (pte.writable() && !pte.readable()) {
+            return None;
+        }
+        let base: PhysAddr = pte.ppn().into();
+        Some(PhysAddr(base.0 + va.page_offset()))
+    }
+
+    /// Check all destination pages before copying, so a bad tail cannot cause a partial write.
+    pub fn copy_to_user(&self, start: usize, bytes: &[u8]) -> bool {
+        let end = match start.checked_add(bytes.len()) {
+            Some(end) => end,
+            None => return false,
+        };
+        let mut current = start;
+        while current < end {
+            if self
+                .translate_user_byte(current, MapPermission::W)
+                .is_none()
+            {
+                return false;
+            }
+            current += (PAGE_SIZE - current % PAGE_SIZE).min(end - current);
+        }
+        current = start;
+        while current < end {
+            let va = VirtAddr::from(current);
+            let pte = self.translate(va.floor()).unwrap();
+            let count = (PAGE_SIZE - va.page_offset()).min(end - current);
+            pte.ppn().get_bytes_array()[va.page_offset()..va.page_offset() + count]
+                .copy_from_slice(&bytes[current - start..current - start + count]);
+            current += count;
+        }
+        true
+    }
+
+    /// Read a bounded, null-terminated UTF-8 string through the user page table.
+    pub fn read_user_string(&self, start: usize, limit: usize) -> Option<alloc::string::String> {
+        let mut bytes = Vec::with_capacity(limit);
+        for offset in 0..=limit {
+            let address = self.translate_user_byte(start.checked_add(offset)?, MapPermission::R)?;
+            // SAFETY: the readable frame remains mapped throughout this call.
+            let byte = unsafe { (address.0 as *const u8).read_volatile() };
+            if byte == 0 {
+                return alloc::string::String::from_utf8(bytes).ok();
+            }
+            if offset == limit {
+                break;
+            }
+            bytes.push(byte);
+        }
+        None
+    }
+
+    /// Allocate an anonymous area with fallible data and page-table allocation.
+    pub fn map_user_range(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
+        let range = match checked_page_range(start, len) {
+            Some(range) => range,
+            None => return false,
+        };
+        if range.into_iter().any(|vpn| self.translate(vpn).is_some()) {
+            return false;
+        }
+        if len == 0 {
+            return true;
+        }
+        let mut area = MapArea {
+            vpn_range: range,
+            data_frames: BTreeMap::new(),
+            map_type: MapType::Framed,
+            map_perm: permission,
+        };
+        let flags = PTEFlags::from_bits(permission.bits).unwrap();
+        for vpn in range {
+            let mapped = frame_alloc().and_then(|frame| {
+                self.page_table.try_map(vpn, frame.ppn, flags)?;
+                area.data_frames.insert(vpn, frame);
+                Some(())
+            });
+            if mapped.is_none() {
+                // Drop releases all allocated data frames; retained page-table
+                // structure is owned by PageTable until this address space exits.
+                for &mapped_vpn in area.data_frames.keys() {
+                    self.page_table.unmap(mapped_vpn);
+                }
+                return false;
+            }
+        }
+        self.areas.push(area);
+        true
+    }
+
+    /// Remove a user range, preserving the remaining sides of partially unmapped areas.
+    pub fn unmap_user_range(&mut self, start: usize, len: usize) -> bool {
+        let range = match checked_page_range(start, len) {
+            Some(range) => range,
+            None => return false,
+        };
+        // Supervisor-only trampoline and trap-context pages must remain intact.
+        if range.into_iter().any(|vpn| {
+            self.translate(vpn)
+                .map_or(true, |pte| !pte.flags().contains(PTEFlags::U))
+        }) {
+            return false;
+        }
+        if len == 0 {
+            return true;
+        }
+        let old_areas = core::mem::take(&mut self.areas);
+        for mut area in old_areas {
+            let begin = area.vpn_range.get_start();
+            let end = area.vpn_range.get_end();
+            let cut_begin = begin.max(range.get_start());
+            let cut_end = end.min(range.get_end());
+            if cut_begin >= cut_end {
+                self.areas.push(area);
+                continue;
+            }
+            for vpn in VPNRange::new(cut_begin, cut_end) {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+            let right_frames = area.data_frames.split_off(&cut_end);
+            if cut_end < end {
+                self.areas.push(MapArea {
+                    vpn_range: VPNRange::new(cut_end, end),
+                    data_frames: right_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                });
+            }
+            if begin < cut_begin {
+                area.vpn_range = VPNRange::new(begin, cut_begin);
+                self.areas.push(area);
+            }
+        }
+        true
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
@@ -318,6 +469,22 @@ impl MemorySet {
             false
         }
     }
+}
+/// Validate alignment, overflow and Sv39 canonical addresses before constructing VPNs.
+fn checked_page_range(start: usize, len: usize) -> Option<VPNRange> {
+    if start % PAGE_SIZE != 0 || usize::from(VirtAddr::from(start)) != start {
+        return None;
+    }
+    let start_vpn = VirtAddr::from(start).floor();
+    if len == 0 {
+        return Some(VPNRange::new(start_vpn, start_vpn));
+    }
+    let last = start.checked_add(len - 1)?;
+    if usize::from(VirtAddr::from(last)) != last || (start >> 38) != (last >> 38) {
+        return None;
+    }
+    let pages = (len - 1) / PAGE_SIZE + 1;
+    Some(VPNRange::new(start_vpn, VirtPageNum(start_vpn.0 + pages)))
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

@@ -4,12 +4,17 @@ use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use lazy_static::*;
-///A array of `TaskControlBlock` that is thread-safe
+
+// A u128 accumulator keeps wraparound out of the scheduling horizon, and
+// this numerator gives every legal isize priority a positive step.
+const BIG_STRIDE: u128 = 1 << 64;
+
+/// Ready processes in enqueue order.
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// Stride scheduler with FIFO order for equal accumulated strides.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -23,7 +28,19 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        // Lab3 implementation assisted by Codex. Selection rule from
+        // https://learningos.cn/rCore-Tutorial-Guide/chapter5/4exercise.html
+        let (index, _) = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, task)| task.inner_exclusive_access().stride)?;
+        let task = self.ready_queue.remove(index).unwrap();
+        {
+            let mut inner = task.inner_exclusive_access();
+            inner.stride += BIG_STRIDE / inner.priority as u128;
+        }
+        Some(task)
     }
 }
 

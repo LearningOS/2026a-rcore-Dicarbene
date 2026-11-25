@@ -1,5 +1,5 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
+use crate::fs::{open_file, OpenFlags, Stat, ROOT_INODE};
 use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
 use crate::task::{current_task, current_user_token};
 
@@ -75,29 +75,65 @@ pub fn sys_close(fd: usize) -> isize {
     0
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Return metadata using the course's C ABI, including when the output crosses a page.
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let Some(stat) = inner
+        .fd_table
+        .get(fd)
+        .and_then(Option::as_ref)
+        .and_then(|file| file.stat())
+    else {
+        return -1;
+    };
+    // SAFETY: repr(C) fields fill all 80 bytes, and the reserved words are initialized.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&stat as *const Stat).cast::<u8>(),
+            core::mem::size_of::<Stat>(),
+        )
+    };
+    if inner.memory_set.copy_to_user(st as usize, bytes) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Give an existing inode an additional name in the root directory.
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let read_name = |ptr| {
+        inner
+            .memory_set
+            .read_user_string(ptr, easy_fs::NAME_LENGTH_LIMIT)
+    };
+    let (Some(old), Some(new)) = (read_name(old_name as usize), read_name(new_name as usize))
+    else {
+        return -1;
+    };
+    if ROOT_INODE.link(&old, &new).is_some() {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Remove a root directory entry and release the inode once it has no references.
+pub fn sys_unlinkat(name: *const u8) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let Some(name) = inner
+        .memory_set
+        .read_user_string(name as usize, easy_fs::NAME_LENGTH_LIMIT)
+    else {
+        return -1;
+    };
+    if ROOT_INODE.unlink(&name).is_some() {
+        0
+    } else {
+        -1
+    }
 }

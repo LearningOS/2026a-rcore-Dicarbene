@@ -3,7 +3,7 @@ use super::{
     SuperBlock,
 };
 use crate::BLOCK_SZ;
-use alloc::sync::Arc;
+use alloc::{collections::BTreeMap, sync::Arc};
 use spin::Mutex;
 ///An easy file system on block
 pub struct EasyFileSystem {
@@ -15,6 +15,13 @@ pub struct EasyFileSystem {
     pub data_bitmap: Bitmap,
     inode_area_start_block: u32,
     data_area_start_block: u32,
+    pub(crate) open_files: BTreeMap<u32, OpenInode>,
+}
+
+#[derive(Default)]
+pub(crate) struct OpenInode {
+    pub(crate) handles: usize,
+    pub(crate) unlinked: bool,
 }
 
 type DataBlock = [u8; BLOCK_SZ];
@@ -45,6 +52,7 @@ impl EasyFileSystem {
             data_bitmap,
             inode_area_start_block: 1 + inode_bitmap_blocks,
             data_area_start_block: 1 + inode_total_blocks + data_bitmap_blocks,
+            open_files: BTreeMap::new(),
         };
         // clear all blocks
         for i in 0..total_blocks {
@@ -99,6 +107,7 @@ impl EasyFileSystem {
                     ),
                     inode_area_start_block: 1 + super_block.inode_bitmap_blocks,
                     data_area_start_block: 1 + inode_total_blocks + super_block.data_bitmap_blocks,
+                    open_files: BTreeMap::new(),
                 };
                 Arc::new(Mutex::new(efs))
             })
@@ -128,6 +137,20 @@ impl EasyFileSystem {
     /// Allocate a new inode
     pub fn alloc_inode(&mut self) -> u32 {
         self.inode_bitmap.alloc(&self.block_device).unwrap() as u32
+    }
+
+    pub(crate) fn reclaim_file(&mut self, inode_id: u32) {
+        let (block, offset) = self.get_disk_inode_pos(inode_id);
+        let data = get_block_cache(block as usize, self.block_device.clone())
+            .lock()
+            .modify(offset, |inode: &mut DiskInode| {
+                inode.clear_size(&self.block_device)
+            });
+        for block in data {
+            self.dealloc_data(block);
+        }
+        self.inode_bitmap
+            .dealloc(&self.block_device, inode_id as usize);
     }
 
     /// Allocate a data block

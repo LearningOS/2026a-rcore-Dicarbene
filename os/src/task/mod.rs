@@ -93,6 +93,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     inner.children.clear();
     // deallocate user space
     inner.memory_set.recycle_data_pages();
+    inner.fd_table.clear();
     // drop file descriptors
     inner.fd_table.clear();
     drop(inner);
