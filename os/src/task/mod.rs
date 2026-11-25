@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MemorySet;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -158,6 +159,31 @@ impl TaskManager {
 /// Run the first task in task list.
 pub fn run_first_task() {
     TASK_MANAGER.run_first_task();
+}
+
+/// Access the current address space without retaining a borrow across scheduling.
+pub fn with_current_memory_set<R>(f: impl FnOnce(&mut MemorySet) -> R) -> R {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    f(&mut inner.tasks[current].memory_set)
+}
+
+/// Count before dispatch so trace queries include themselves and yield is attributed correctly.
+pub fn record_syscall(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_times.get_mut(syscall_id) {
+        *count += 1;
+    }
+}
+
+/// Return -1 for IDs outside the supported counter table.
+pub fn current_syscall_count(syscall_id: usize) -> isize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.tasks[inner.current_task]
+        .syscall_times
+        .get(syscall_id)
+        .map_or(-1, |count| *count as isize)
 }
 
 /// Switch current `Running` task to the task we have found,
