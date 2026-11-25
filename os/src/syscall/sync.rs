@@ -1,7 +1,10 @@
-use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
+use crate::sync::{would_deadlock, Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+const DEADLOCK: isize = -0xDEAD;
 /// sleep syscall
 pub fn sys_sleep(ms: usize) -> isize {
     trace!(
@@ -70,7 +73,34 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     );
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
-    let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    let Some(mutex) = process_inner
+        .mutex_list
+        .get(mutex_id)
+        .and_then(Option::as_ref)
+        .cloned()
+    else {
+        return -1;
+    };
+    if process_inner.deadlock_detection {
+        let states: Vec<_> = process_inner
+            .mutex_list
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map_or_else(Default::default, |mutex| mutex.state())
+            })
+            .collect();
+        if would_deadlock(
+            &process_inner.tasks,
+            &states,
+            &current_task().unwrap(),
+            mutex_id,
+            false,
+        ) {
+            return DEADLOCK;
+        }
+    }
     drop(process_inner);
     drop(process);
     mutex.lock();
@@ -91,7 +121,14 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
     );
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
-    let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    let Some(mutex) = process_inner
+        .mutex_list
+        .get(mutex_id)
+        .and_then(Option::as_ref)
+        .cloned()
+    else {
+        return -1;
+    };
     drop(process_inner);
     drop(process);
     mutex.unlock();
@@ -144,7 +181,14 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
     );
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
-    let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
+    let Some(sem) = process_inner
+        .semaphore_list
+        .get(sem_id)
+        .and_then(Option::as_ref)
+        .cloned()
+    else {
+        return -1;
+    };
     drop(process_inner);
     sem.up();
     0
@@ -164,8 +208,36 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     );
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
-    let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
+    let Some(sem) = process_inner
+        .semaphore_list
+        .get(sem_id)
+        .and_then(Option::as_ref)
+        .cloned()
+    else {
+        return -1;
+    };
+    if process_inner.deadlock_detection {
+        let states: Vec<_> = process_inner
+            .semaphore_list
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map_or_else(Default::default, |sem| sem.state())
+            })
+            .collect();
+        if would_deadlock(
+            &process_inner.tasks,
+            &states,
+            &current_task().unwrap(),
+            sem_id,
+            true,
+        ) {
+            return DEADLOCK;
+        }
+    }
     drop(process_inner);
+    drop(process);
     sem.down();
     0
 }
@@ -242,10 +314,13 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     condvar.wait(mutex);
     0
 }
-/// enable deadlock detection syscall
-///
-/// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+/// Enable or disable detection without discarding the live resource state.
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    if enabled > 1 {
+        return -1;
+    }
+    current_process()
+        .inner_exclusive_access()
+        .deadlock_detection = enabled == 1;
+    0
 }

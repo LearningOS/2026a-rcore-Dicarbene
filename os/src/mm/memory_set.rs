@@ -259,6 +259,55 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Lab2 user-memory access, implemented with Codex assistance according to
+    /// https://learningos.cn/rCore-Tutorial-Guide/chapter4/7exercise.html
+    pub fn translate_user_byte(
+        &self,
+        address: usize,
+        permission: MapPermission,
+    ) -> Option<PhysAddr> {
+        let va = VirtAddr::from(address);
+        // VirtAddr::from masks high bits; reject non-canonical aliases first.
+        if usize::from(va) != address {
+            return None;
+        }
+        let pte = self.translate(va.floor())?;
+        let required = PTEFlags::from_bits((permission | MapPermission::U).bits).unwrap();
+        if !pte.flags().contains(required) || (pte.writable() && !pte.readable()) {
+            return None;
+        }
+        let base: PhysAddr = pte.ppn().into();
+        Some(PhysAddr(base.0 + va.page_offset()))
+    }
+
+    /// Check all destination pages before copying, so a bad tail cannot cause a partial write.
+    pub fn copy_to_user(&self, start: usize, bytes: &[u8]) -> bool {
+        let end = match start.checked_add(bytes.len()) {
+            Some(end) => end,
+            None => return false,
+        };
+        let mut current = start;
+        while current < end {
+            if self
+                .translate_user_byte(current, MapPermission::W)
+                .is_none()
+            {
+                return false;
+            }
+            current += (PAGE_SIZE - current % PAGE_SIZE).min(end - current);
+        }
+        current = start;
+        while current < end {
+            let va = VirtAddr::from(current);
+            let pte = self.translate(va.floor()).unwrap();
+            let count = (PAGE_SIZE - va.page_offset()).min(end - current);
+            pte.ppn().get_bytes_array()[va.page_offset()..va.page_offset() + count]
+                .copy_from_slice(&bytes[current - start..current - start + count]);
+            current += count;
+        }
+        true
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();

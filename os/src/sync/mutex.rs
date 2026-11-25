@@ -1,105 +1,128 @@
-//! Mutex (spin-like and blocking(sleep))
+//! Mutexes with yielding or blocking waits.
 
-use super::UPSafeCell;
-use crate::task::TaskControlBlock;
-use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
-use crate::task::{current_task, wakeup_task};
-use alloc::{collections::VecDeque, sync::Arc};
+use super::{ResourceState, UPSafeCell};
+use crate::task::{
+    block_current_and_run_next, current_task, suspend_current_and_run_next, wakeup_task,
+    TaskControlBlock,
+};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+};
 
-/// Mutex trait
+/// Common interface for both mutex implementations.
 pub trait Mutex: Sync + Send {
-    /// Lock the mutex
+    /// Acquire the mutex.
     fn lock(&self);
-    /// Unlock the mutex
+    /// Release the mutex or transfer ownership.
     fn unlock(&self);
+    /// Snapshot its owner and wait queue.
+    fn state(&self) -> ResourceState;
 }
 
-/// Spinlock Mutex struct
+#[derive(Default)]
+struct MutexState {
+    owner: Option<Weak<TaskControlBlock>>,
+    waiters: VecDeque<Weak<TaskControlBlock>>,
+}
+
+impl MutexState {
+    fn snapshot(&self) -> ResourceState {
+        ResourceState {
+            available: usize::from(self.owner.is_none()),
+            owners: self.owner.iter().map(|owner| (owner.as_ptr(), 1)).collect(),
+            waiters: self.waiters.iter().map(Weak::as_ptr).collect(),
+        }
+    }
+}
+
+/// A mutex that yields while waiting for the owner to unlock.
 pub struct MutexSpin {
-    locked: UPSafeCell<bool>,
+    inner: UPSafeCell<MutexState>,
 }
 
 impl MutexSpin {
-    /// Create a new spinlock mutex
+    /// Construct an unlocked mutex.
     pub fn new() -> Self {
         Self {
-            locked: unsafe { UPSafeCell::new(false) },
+            inner: unsafe { UPSafeCell::new(MutexState::default()) },
         }
     }
 }
 
 impl Mutex for MutexSpin {
-    /// Lock the spinlock mutex
     fn lock(&self) {
-        trace!("kernel: MutexSpin::lock");
         loop {
-            let mut locked = self.locked.exclusive_access();
-            if *locked {
-                drop(locked);
-                suspend_current_and_run_next();
-                continue;
-            } else {
-                *locked = true;
+            let task = Arc::downgrade(&current_task().unwrap());
+            let mut inner = self.inner.exclusive_access();
+            if inner.owner.is_none() {
+                inner
+                    .waiters
+                    .retain(|waiting| !Weak::ptr_eq(waiting, &task));
+                inner.owner = Some(task);
                 return;
             }
+            if !inner
+                .waiters
+                .iter()
+                .any(|waiting| Weak::ptr_eq(waiting, &task))
+            {
+                inner.waiters.push_back(task);
+            }
+            drop(inner);
+            suspend_current_and_run_next();
         }
     }
 
     fn unlock(&self) {
-        trace!("kernel: MutexSpin::unlock");
-        let mut locked = self.locked.exclusive_access();
-        *locked = false;
+        self.inner.exclusive_access().owner = None;
+    }
+
+    fn state(&self) -> ResourceState {
+        self.inner.exclusive_access().snapshot()
     }
 }
 
-/// Blocking Mutex struct
+/// A mutex that queues and blocks waiters.
 pub struct MutexBlocking {
-    inner: UPSafeCell<MutexBlockingInner>,
-}
-
-pub struct MutexBlockingInner {
-    locked: bool,
-    wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    inner: UPSafeCell<MutexState>,
 }
 
 impl MutexBlocking {
-    /// Create a new blocking mutex
+    /// Construct an unlocked mutex.
     pub fn new() -> Self {
-        trace!("kernel: MutexBlocking::new");
         Self {
-            inner: unsafe {
-                UPSafeCell::new(MutexBlockingInner {
-                    locked: false,
-                    wait_queue: VecDeque::new(),
-                })
-            },
+            inner: unsafe { UPSafeCell::new(MutexState::default()) },
         }
     }
 }
 
 impl Mutex for MutexBlocking {
-    /// lock the blocking mutex
     fn lock(&self) {
-        trace!("kernel: MutexBlocking::lock");
-        let mut mutex_inner = self.inner.exclusive_access();
-        if mutex_inner.locked {
-            mutex_inner.wait_queue.push_back(current_task().unwrap());
-            drop(mutex_inner);
+        let task = Arc::downgrade(&current_task().unwrap());
+        let mut inner = self.inner.exclusive_access();
+        if inner.owner.is_some() {
+            inner.waiters.push_back(task);
+            drop(inner);
             block_current_and_run_next();
         } else {
-            mutex_inner.locked = true;
+            inner.owner = Some(task);
         }
     }
 
-    /// unlock the blocking mutex
     fn unlock(&self) {
-        trace!("kernel: MutexBlocking::unlock");
-        let mut mutex_inner = self.inner.exclusive_access();
-        assert!(mutex_inner.locked);
-        if let Some(waking_task) = mutex_inner.wait_queue.pop_front() {
-            wakeup_task(waking_task);
+        let mut inner = self.inner.exclusive_access();
+        if let Some(task) =
+            core::iter::from_fn(|| inner.waiters.pop_front()).find_map(|waiter| waiter.upgrade())
+        {
+            inner.owner = Some(Arc::downgrade(&task));
+            wakeup_task(task);
         } else {
-            mutex_inner.locked = false;
+            inner.owner = None;
         }
+    }
+
+    fn state(&self) -> ResourceState {
+        self.inner.exclusive_access().snapshot()
     }
 }
