@@ -1,6 +1,6 @@
 //! Process management syscalls
 use crate::{
-    task::{exit_current_and_run_next, suspend_current_and_run_next},
+    task::{current_syscall_count, exit_current_and_run_next, suspend_current_and_run_next},
     timer::get_time_us,
 };
 
@@ -38,8 +38,19 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     0
 }
 
-// TODO: implement the syscall
-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
+/// Read/write one byte or query the current task's syscall count.
+/// Implemented with Codex assistance; request semantics follow the lab guide:
+/// https://learningos.github.io/rCore-Tutorial-Guide/chapter3/5exercise.html
+pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
     trace!("kernel: sys_trace");
-    -1
+    match trace_request {
+        // Chapter 3 has no virtual memory; the caller supplies a valid address.
+        0 => unsafe { core::ptr::read_volatile(id as *const u8) as isize },
+        1 => {
+            unsafe { core::ptr::write_volatile(id as *mut u8, data as u8) };
+            0
+        }
+        2 => current_syscall_count(id),
+        _ => -1,
+    }
 }

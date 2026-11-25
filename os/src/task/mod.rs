@@ -54,6 +54,7 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_times: [0; task::MAX_SYSCALL_NUM],
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -140,6 +141,24 @@ impl TaskManager {
 /// Run the first task in task list.
 pub fn run_first_task() {
     TASK_MANAGER.run_first_task();
+}
+
+/// Record a syscall before dispatch, including calls that switch tasks or exit.
+pub fn record_syscall(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_times.get_mut(syscall_id) {
+        *count += 1;
+    }
+}
+
+/// Query the current task without indexing outside the counter array.
+pub fn current_syscall_count(syscall_id: usize) -> isize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.tasks[inner.current_task]
+        .syscall_times
+        .get(syscall_id)
+        .map_or(-1, |count| *count as isize)
 }
 
 /// Switch current `Running` task to the task we have found,
